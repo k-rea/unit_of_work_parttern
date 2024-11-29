@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 
 // --- Domainモデル ---
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct User {
     pub id: i32,
     pub name: String,
@@ -62,27 +62,50 @@ impl ToSql for String {
         Some(self.clone())
     }
 }
+// トレイトを分割して、ジェネリックな部分を別のトレイトに移動
+// トランザクション操作を表す型消去されたトレイト
+#[async_trait]
+pub trait BoxedTransactionOperation: Send + Sync {
+    async fn execute(&self, transaction: &mut Box<dyn TransactionWrapper>) -> Result<(), Error>;
+}
 
-pub struct TransactionManager {
+#[async_trait]
+pub trait TransactionManager: Send + Sync {
+    async fn execute(&self, operation: Box<dyn BoxedTransactionOperation>) -> Result<(), Error>;
+}
+
+
+// 具体的な操作を表す構造体
+pub struct InsertUserOperation {
+    pub user: User,
+    pub user_repository: Arc<dyn UserRepository>,
+}
+
+// BoxedTransactionOperationの実装
+#[async_trait]
+impl BoxedTransactionOperation for InsertUserOperation {
+    async fn execute(&self, transaction: &mut Box<dyn TransactionWrapper>) -> Result<(), Error> {
+        self.user_repository.insert_user(transaction, self.user.clone()).await
+    }
+}
+
+pub struct PgTransactionManager {
     pool: PgPool,
 }
 
-impl TransactionManager {
+impl PgTransactionManager {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn run_in_transaction<F, T>(&self, operation: F) -> Result<T, Error>
-    where
-        F: FnOnce(&mut Box<dyn TransactionWrapper>) -> futures::future::BoxFuture<'_, Result<T, Error>>
-        + Send
-        + 'static,
-        T: Send + 'static,
-    {
+#[async_trait]
+impl TransactionManager for PgTransactionManager {
+    async fn execute(&self, operation: Box<dyn BoxedTransactionOperation>) -> Result<(), Error> {
         let mut transaction: Box<dyn TransactionWrapper> =
             Box::new(SqlxTransaction::new(self.pool.begin().await?));
 
-        match operation(&mut transaction).await {
+        match operation.execute(&mut transaction).await {
             Ok(result) => {
                 transaction.commit().await?;
                 Ok(result)
@@ -149,7 +172,7 @@ impl<'t> TransactionWrapper for SqlxTransaction<'t> {
 
 // --- State ---
 pub struct AppState {
-    pub transaction_manager: Arc<TransactionManager>,
+    pub transaction_manager: Arc<dyn TransactionManager>,
     pub user_repository: Arc<dyn UserRepository>,
 }
 
@@ -158,24 +181,22 @@ async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(user): Json<User>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // クロージャーで使用する値を事前に準備
-    let user_repository = state.user_repository.clone();
+    let operation = Box::new(InsertUserOperation {
+        user,
+        user_repository: state.user_repository.clone(),
+    });
 
     state
         .transaction_manager
-        .run_in_transaction(move |transaction| {
-            Box::pin(async move {
-                user_repository.insert_user(transaction, user).await?;
-                Ok(())
-            })
-        })
+        .execute(operation)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to process request: {:?}", e)
+                format!("Failed to process request: {:?}", e),
             )
         })?;
+
     Ok(StatusCode::CREATED)
 }
 
@@ -185,7 +206,7 @@ async fn main() -> Result<(), Error> {
     let pool = PgPool::connect(&database_url).await?;
     // State を作成
     let state = Arc::new(AppState {
-        transaction_manager: Arc::new(TransactionManager::new(pool)),
+        transaction_manager: Arc::new(PgTransactionManager::new(pool)),
         user_repository: Arc::new(PgUserRepository),
     });
 
