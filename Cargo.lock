@@ -1794,6 +1794,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "serde",
  "sqlx",
  "tokio",
 ]

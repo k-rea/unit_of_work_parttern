@@ -1,8 +1,13 @@
+use std::sync::Arc;
 use async_trait::async_trait;
+use axum::{extract::{Json, State}, http::StatusCode, Router};
 use anyhow::{anyhow, Error};
+use axum::routing::post;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 
-// --- Domainモデル ---#[derive(Debug)]
+// --- Domainモデル ---
+#[derive(Debug, Serialize, Deserialize)]
 pub struct User {
     pub id: i32,
     pub name: String,
@@ -109,24 +114,60 @@ impl TransactionWrapper for MockTransactionWrapper {
     }
 }
 
+// --- State ---
+pub struct AppState {
+    pub pool: PgPool,
+    pub user_repository: Arc<dyn UserRepository>,
+}
+
+// --- handlers ---
+async fn create_user(
+    State(state): State<Arc<AppState>>,
+    Json(user): Json<User>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut transaction = SqlxTransaction::new(state.pool.begin().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to begin transaction: {:?}", e),
+        )
+    })?);
+    state
+        .user_repository
+        .insert_user(&mut transaction, user)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to insert user: {:?}", e),
+            )
+        })?;
+
+    transaction.transaction.commit().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to commit transaction: {:?}", e),
+        )
+    })?;
+    Ok(StatusCode::CREATED)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let database_url = "postgres://postgres:postgres@localhost:5452/app";
     let pool = PgPool::connect(&database_url).await?;
-    let sqlx_transaction= pool.begin().await?;
-    let mut transaction = SqlxTransaction::new(sqlx_transaction);
+    // State を作成
+    let state = Arc::new(AppState {
+        pool,
+        user_repository: Arc::new(PgUserRepository),
+    });
 
-    let user_repository = PgUserRepository;
+    let app = Router::new()
+        .route("/users", post(create_user))
+        .with_state(state);
 
-    let user = User {
-        id: 2,
-        name: "Bob".to_string(),
-        email: "bob@test.com".to_string(),
-    };
+    println!("Server running at http://localhost:3000");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
-    user_repository.insert_user(&mut transaction, user).await?;
-    transaction.transaction.commit().await?;
-
-    println!("User inserted successfully!");
     Ok(())
 }
