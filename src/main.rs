@@ -63,9 +63,42 @@ impl ToSql for String {
     }
 }
 
+pub struct TransactionManager {
+    pool: PgPool,
+}
+
+impl TransactionManager {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn run_in_transaction<F, T>(&self, operation: F) -> Result<T, Error>
+    where
+        F: FnOnce(&mut Box<dyn TransactionWrapper>) -> futures::future::BoxFuture<'_, Result<T, Error>>
+        + Send
+        + 'static,
+        T: Send + 'static,
+    {
+        let mut transaction: Box<dyn TransactionWrapper> =
+            Box::new(SqlxTransaction::new(self.pool.begin().await?));
+
+        match operation(&mut transaction).await {
+            Ok(result) => {
+                transaction.commit().await?;
+                Ok(result)
+            }
+            Err(e) => {
+                transaction.rollback().await?;
+                Err(e)
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait TransactionWrapper: Send + Sync {
     async fn execute(&mut self, query: &str, params: Vec<Box<dyn ToSql>>) -> Result<(), anyhow::Error>;
+    async fn rollback(self: Box<Self>) -> Result<(), Error>;
     async fn commit(self: Box<Self>) -> Result<(), Error>;
 }
 
@@ -100,8 +133,11 @@ impl<'t> TransactionWrapper for SqlxTransaction<'t> {
         sqlx_query.execute(&mut *self.transaction).await.map_err(|e| {
             anyhow!("Failed to execute query: {:?}, error: {:?}", query, e)
         })?;
-
         Ok(())
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), Error> {
+        self.transaction.rollback().await.map_err(|e| anyhow!(e))
     }
 
     async fn commit(self: Box<Self>) -> Result<(), Error> {
@@ -111,32 +147,10 @@ impl<'t> TransactionWrapper for SqlxTransaction<'t> {
     }
 }
 
-
-pub struct MockTransactionWrapper;
-
-#[async_trait]
-impl TransactionWrapper for MockTransactionWrapper {
-    async fn execute(&mut self, query: &str, params: Vec<Box<dyn ToSql>>) -> Result<(), Error> {
-        println!("Mock execute: query = {}, params = {:?}", query, params);
-        Ok(())
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), Error> {
-        todo!()
-    }
-}
-
 // --- State ---
 pub struct AppState {
-    pub pool: PgPool,
+    pub transaction_manager: Arc<TransactionManager>,
     pub user_repository: Arc<dyn UserRepository>,
-}
-
-impl AppState {
-    pub async fn begin_transaction(&self) -> Result<Box<dyn TransactionWrapper>, Error> {
-        let transaction = self.pool.begin().await?;
-        Ok(Box::new(SqlxTransaction::new(transaction)))
-    }
 }
 
 // --- handlers ---
@@ -144,29 +158,24 @@ async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(user): Json<User>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut transaction = state.begin_transaction().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to begin transaction: {:?}", e),
-        )
-    })?;
+    // クロージャーで使用する値を事前に準備
+    let user_repository = state.user_repository.clone();
+
     state
-        .user_repository
-        .insert_user(&mut transaction, user)
+        .transaction_manager
+        .run_in_transaction(move |transaction| {
+            Box::pin(async move {
+                user_repository.insert_user(transaction, user).await?;
+                Ok(())
+            })
+        })
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to insert user: {:?}", e),
+                format!("Failed to process request: {:?}", e)
             )
         })?;
-
-    transaction.commit().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to commit transaction: {:?}", e),
-        )
-    })?;
     Ok(StatusCode::CREATED)
 }
 
@@ -176,7 +185,7 @@ async fn main() -> Result<(), Error> {
     let pool = PgPool::connect(&database_url).await?;
     // State を作成
     let state = Arc::new(AppState {
-        pool,
+        transaction_manager: Arc::new(TransactionManager::new(pool)),
         user_repository: Arc::new(PgUserRepository),
     });
 
