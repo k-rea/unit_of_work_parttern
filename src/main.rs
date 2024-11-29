@@ -18,7 +18,7 @@ pub struct User {
 pub trait UserRepository: Send + Sync {
     async fn insert_user(
         &self,
-        transaction: &mut dyn TransactionWrapper,
+        transaction: &mut Box<dyn TransactionWrapper>,
         user: User,
     ) -> Result<(), Error>;
 }
@@ -29,7 +29,7 @@ pub struct PgUserRepository;
 impl UserRepository for PgUserRepository {
     async fn insert_user(
         &self,
-        transaction: &mut dyn TransactionWrapper,
+        transaction: &mut Box<dyn TransactionWrapper>,
         user: User,
     ) -> Result<(), Error> {
         let query = "INSERT INTO users (id, name, email) VALUES ($1, $2, $3)";
@@ -62,6 +62,13 @@ impl ToSql for String {
         Some(self.clone())
     }
 }
+
+#[async_trait]
+pub trait TransactionWrapper: Send + Sync {
+    async fn execute(&mut self, query: &str, params: Vec<Box<dyn ToSql>>) -> Result<(), anyhow::Error>;
+    async fn commit(self: Box<Self>) -> Result<(), Error>;
+}
+
 pub struct SqlxTransaction<'t> {
     transaction: Transaction<'t, Postgres>,
 }
@@ -70,11 +77,6 @@ impl<'a> SqlxTransaction<'a> {
     pub fn new(transaction: Transaction<'a, Postgres>) -> Self {
         Self { transaction }
     }
-}
-
-#[async_trait]
-pub trait TransactionWrapper: Send {
-    async fn execute(&mut self, query: &str, params: Vec<Box<dyn ToSql>>) -> Result<(), anyhow::Error>;
 }
 
 #[async_trait]
@@ -101,6 +103,12 @@ impl<'t> TransactionWrapper for SqlxTransaction<'t> {
 
         Ok(())
     }
+
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        self.transaction.commit().await.map_err(|e| {
+            anyhow!("Failed to commit transaction: {:?}", e)
+        })
+    }
 }
 
 
@@ -112,6 +120,10 @@ impl TransactionWrapper for MockTransactionWrapper {
         println!("Mock execute: query = {}, params = {:?}", query, params);
         Ok(())
     }
+
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        todo!()
+    }
 }
 
 // --- State ---
@@ -120,17 +132,24 @@ pub struct AppState {
     pub user_repository: Arc<dyn UserRepository>,
 }
 
+impl AppState {
+    pub async fn begin_transaction(&self) -> Result<Box<dyn TransactionWrapper>, Error> {
+        let transaction = self.pool.begin().await?;
+        Ok(Box::new(SqlxTransaction::new(transaction)))
+    }
+}
+
 // --- handlers ---
 async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(user): Json<User>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut transaction = SqlxTransaction::new(state.pool.begin().await.map_err(|e| {
+    let mut transaction = state.begin_transaction().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to begin transaction: {:?}", e),
         )
-    })?);
+    })?;
     state
         .user_repository
         .insert_user(&mut transaction, user)
@@ -142,7 +161,7 @@ async fn create_user(
             )
         })?;
 
-    transaction.transaction.commit().await.map_err(|e| {
+    transaction.commit().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to commit transaction: {:?}", e),
