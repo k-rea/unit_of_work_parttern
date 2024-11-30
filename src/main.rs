@@ -1,3 +1,6 @@
+mod core;
+mod adapter;
+
 use std::sync::Arc;
 use async_trait::async_trait;
 use axum::{extract::{Json, State}, http::StatusCode, Router};
